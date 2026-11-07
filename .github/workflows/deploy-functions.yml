@@ -1,0 +1,25 @@
+name: Deploy Supabase function
+on:
+  push:
+    branches: [main]
+    paths:
+      - "index.ts"
+  workflow_dispatch:
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare function folder
+        run: |
+          mkdir -p supabase/functions/api
+          cp index.ts supabase/functions/api/index.ts
+          cp config.toml supabase/config.toml
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      - name: Deploy api function
+        run: supabase functions deploy api --project-ref "$PROJECT_REF" --no-verify-jwt
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
