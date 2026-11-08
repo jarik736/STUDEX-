@@ -19,6 +19,8 @@
     bad_description: 'Описание слишком короткое или длинное',
     bad_amount: 'Введите корректную сумму',
     bad_message: 'Сообщение пустое или слишком длинное',
+    bad_file: 'Файл не принят: формат не поддерживается, он больше 10 МБ или не загрузился',
+    gone: 'Файл удалён по сроку хранения',
   };
   const errMsg = (e) => ERR[e && e.error] || 'Что-то пошло не так. Попробуйте ещё раз';
   let ME = null, busy = false, sig = '';
@@ -39,13 +41,20 @@
     const s = j.state;
     if (!s || !s.me) { ME = null; return; }
     ME = s.me;
+    const top0 = S.st && S.st[S.st.length - 1];
+    const keepId = top0 && (top0.v === 'order' || top0.v === 'chat') ? top0.id : null;
+    const keepObj = keepId ? (S.orders || []).find((o) => o.id == keepId) : null;
     S.users = (s.users || []).map((u) => ({ n: u.n, r: RN[u.r], bl: u.bl }));
     P.length = 0;
     (s.offers || []).forEach((o) => P.push(o));
     S.ads = s.ads || [];
     S.orders = s.orders || [];
+    if (keepObj && !S.orders.some((o) => o.id == keepObj.id)) S.orders.push(keepObj);
+    S.tot = s.tot || null;
+    S.acc = s.acc || {};
+    S.sc = s.sc || {};
     S.msgs = {};
-    Object.keys(s.msgs || {}).forEach((k) => { S.msgs[k] = s.msgs[k].map((m) => [m.w, m.t, hm(m.at)]); });
+    Object.keys(s.msgs || {}).forEach((k) => { S.msgs[k] = s.msgs[k].map((m) => m.f ? [m.w, m.t, hm(m.at), { id: m.f.id, n: m.f.n, s: m.f.gone ? 'файл удалён' : fs(m.f.s), t: m.f.t, gone: m.f.gone }] : [m.w, m.t, hm(m.at)]); });
     S.led = s.led || [];
     S.cs = s.cs || {};
     S.cmp = s.cmp || [];
@@ -148,7 +157,64 @@
     toast('Заказы утверждены');
     draw();
   };
-  window.attach = () => toast('Отправка файлов появится в следующем обновлении');
+  const chatRefresh = (id) => {
+    const ms = document.getElementById('ms');
+    if (ms) { ms.innerHTML = msgs(id, S.role === 'seller' ? 's' : 'b'); document.getElementById('mn').scrollTop = 1e5; }
+  };
+  window.attach = async function (id, el) {
+    const f = el.files && el.files[0];
+    el.value = '';
+    if (!f || busy) return;
+    if (!/\.(pdf|docx?|pptx?|xlsx?|txt|png|jpe?g|webp|dwg|dxf|zip)$/i.test(f.name)) return toast('Этот формат не поддерживается');
+    if (f.size > 10485760) return toast('Файл больше 10 МБ');
+    if (bad(f.name)) return toast('Уберите контакты из названия файла');
+    busy = true;
+    toast('Загрузка файла…');
+    try {
+      const p = (await call('file_prepare', { order: id, name: f.name, size: f.size })).up;
+      const fd = new FormData();
+      fd.append('cacheControl', '3600');
+      fd.append('', f);
+      const r = await fetch(p.url, { method: 'PUT', headers: { apikey: C.ANON_KEY, 'x-upsert': 'false' }, body: fd });
+      if (!r.ok) { console.error('upload', r.status, await r.text().catch(() => '')); throw { error: 'bad_file' }; }
+      apply(await call('file_done', { order: id, path: p.path, name: p.name }));
+      chatRefresh(id);
+      toast('Файл отправлен');
+    } catch (e) { toast(errMsg(e)); }
+    busy = false;
+  };
+  window.pv = async function (id, i) {
+    const f = S.msgs[id] && S.msgs[id][i] && S.msgs[id][i][3];
+    if (!f) return;
+    if (f.gone) return toast('Файл удалён по сроку хранения');
+    let file;
+    try { file = (await call('file_url', { msg: f.id })).file; } catch (e) { return toast(errMsg(e)); }
+    const t = f.t || '';
+    let b = '';
+    try {
+      const blob = await (await fetch(file.url)).blob();
+      if (t.startsWith('image/')) b = '<img src="' + URL.createObjectURL(blob) + '" style="max-width:100%;border-radius:12px" alt="">';
+      else if (t === 'application/pdf') b = '<iframe src="' + URL.createObjectURL(new Blob([blob], { type: t })) + '" style="width:100%;height:70vh;border:0;border-radius:12px;background:#fff"></iframe>';
+      else if (t.startsWith('text/')) b = '<pre style="white-space:pre-wrap;font-size:13px;line-height:1.5">' + esc((await blob.text()).slice(0, 20000)) + '</pre>';
+    } catch (e) { /* покажем только кнопку открытия */ }
+    if (!b) b = '<div class="card mu">Предпросмотр для этого формата недоступен. Откройте файл в браузере.</div>';
+    window.__fu = file.url; window.__fd = file.dl || file.url; window.__fm = f.id; window.__ft = Date.now();
+    const e = document.createElement('div');
+    e.id = 'pvw';
+    e.innerHTML = '<div class="row" style="padding:12px 16px"><button class="rb" aria-label="Закрыть" onclick="document.getElementById(\'pvw\').remove()">' + ic('back') + '</button><b class="sp" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(file.name) + '</b></div><div style="flex:1;overflow:auto;padding:0 16px 20px">' + b + '<button class="btn" style="margin-top:12px" onclick="__fo(\'dl\')">Скачать файл</button><button class="btn" style="margin-top:8px;background:transparent;border:1px solid rgba(255,255,255,.25)" onclick="__fo(\'open\')">Открыть в браузере</button></div>';
+    document.getElementById('app').appendChild(e);
+  };
+  // Ссылка действует недолго, поэтому перед открытием при необходимости запрашивается новая
+  window.__fo = async function (kind) {
+    try {
+      if (Date.now() - window.__ft > 240000) {
+        const fresh = (await call('file_url', { msg: window.__fm })).file;
+        window.__fu = fresh.url; window.__fd = fresh.dl || fresh.url; window.__ft = Date.now();
+      }
+    } catch (e) { return toast(errMsg(e)); }
+    const u = kind === 'dl' ? window.__fd : window.__fu;
+    if (window.Telegram && Telegram.WebApp && Telegram.WebApp.openLink) Telegram.WebApp.openLink(u); else window.open(u);
+  };
   window.send = async function (id) {
     const i = document.getElementById('mi'), t = i.value.trim();
     if (!t) return;
@@ -159,6 +225,52 @@
       const ms = document.getElementById('ms');
       if (ms) { ms.innerHTML = msgs(id, S.role === 'seller' ? 's' : 'b'); document.getElementById('mn').scrollTop = 1e5; }
     } catch (e) { i.value = t; toast(errMsg(e)); }
+  };
+
+  // Чат закрытого заказа и старые заказы подгружаются при открытии
+  async function loadChat(id) {
+    if (!ME || busy) return;
+    try {
+      apply(await call('state', { chat: id }));
+      const top = S.st[S.st.length - 1];
+      if (top && top.v === 'chat' && top.id === id) chatRefresh(id);
+    } catch (e) { /* повторит ближайший опрос */ }
+  }
+  const go0 = go;
+  window.go = function (v, id) {
+    go0(v, id);
+    if (v === 'chat' && S.role !== 'admin' && !(S.msgs[id] && S.msgs[id].length)) loadChat(id);
+  };
+  window.findOrder = async function () {
+    const v = +document.getElementById('fo').value;
+    if (!(v > 0)) return toast('Введите номер заказа');
+    let o = or(v);
+    if (!o && !busy) {
+      try { apply(await call('state', { find: v })); } catch (e) { return toast(errMsg(e)); }
+      o = or(v);
+    }
+    if (o) go('order', o.id); else toast('Заказ не найден');
+  };
+  const ulist0 = ulist;
+  let findT = 0;
+  window.ulist = function () {
+    const q = S.uq || '';
+    if (q && ME && S.role === 'admin') {
+      clearTimeout(findT);
+      findT = setTimeout(async () => {
+        try {
+          const j = await call('users_find', { q });
+          let changed = false;
+          (j.found || []).forEach((x) => {
+            const ex = S.users.find((u) => u.n === x.n);
+            if (!ex) { S.users.push({ n: x.n, r: RN[x.r], bl: x.bl }); changed = true; }
+          });
+          const el = document.getElementById('ul');
+          if (changed && el && S.uq === q) el.innerHTML = ulist0();
+        } catch (e) { /* остаётся локальный список */ }
+      }, 350);
+    }
+    return ulist0();
   };
 
   // Регистрация и вход
@@ -180,8 +292,8 @@
   V.profile = () => {
     const st = S.mystats || {};
     const title = S.dir ? 'Директор' : S.role === 'admin' ? 'Администратор' : S.role === 'seller' ? 'Продавец' : 'Пользователь';
-    return '<div style="text-align:center;margin:8px 0 14px"><div class="ic" style="width:96px;height:96px;border-radius:50%;margin:0 auto 10px">' + cap(56) + '</div><h2 style="margin:0">' + title + ' №' + ME.number + '</h2>' + (st.avg ? '<div class="mu">★ ' + st.avg + ' · ' + st.sales + ' заказов</div>' : '') + '</div>' +
-      '<div class="row" style="margin-bottom:12px"><div class="stat"><b>' + (st.buys || 0) + '</b>Покупок</div><div class="stat"><b>' + (st.sales || 0) + '</b>Продаж</div><div class="stat"><b>' + (st.avg || '—') + '</b>Рейтинг</div></div>' +
+    return '<div style="text-align:center;margin:8px 0 14px"><div class="ic" style="width:96px;height:96px;border-radius:50%;margin:0 auto 10px">' + cap(56) + '</div><h2 style="margin:0">' + title + ' №' + ME.number + '</h2>' + (S.role === 'seller' && st.avg ? '<div class="mu">★ ' + st.avg + ' · ' + st.sales + ' заказов</div>' : '') + '</div>' +
+      '<div class="row" style="margin-bottom:12px"><div class="stat"><b>' + (st.buys || 0) + '</b>Покупок</div><div class="stat"><b>' + (st.sales || 0) + '</b>Продаж</div>' + (S.role === 'seller' ? '<div class="stat"><b>' + (st.avg || '—') + '</b>Рейтинг</div>' : '') + '</div>' +
       '<div class="card cl" onclick="go(\'orders\')">Мои заказы</div>' +
       (S.role === 'buyer' ? '<div class="card cl" onclick="go(\'bal\')">Мои расходы: ' + rub(spent()) + '</div><div class="card cl" onclick="go(\'myads\')">Мои объявления</div><div class="card cl" onclick="go(\'fav\')">Избранное: ' + S.fav.size + '</div>' : '') +
       (S.role === 'seller' ? '<div class="card cl" onclick="go(\'myoff\')">Мои предложения</div>' : '') +
@@ -230,11 +342,15 @@
 
   // Обновление данных раз в несколько секунд
   const signature = () => JSON.stringify([S.orders.map((o) => [o.id, o.st, o.amt]), S.ads.length, S.nt.length, S.cmp.length, Object.keys(S.msgs).map((k) => S.msgs[k].length)]);
+  let tick = 0;
   setInterval(async () => {
     if (!ME || busy || document.hidden || S.reg || S.splash) return;
+    const tc = S.st[S.st.length - 1];
+    tick++;
+    if (!(tc && tc.v === 'chat') && tick % 12) return; // вне чата обновляем раз в минуту, в чате раз в 5 секунд
     try {
       const topc = S.st[S.st.length - 1];
-      const j = await call('state', topc && topc.v === 'chat' && S.role === 'admin' ? { chat: topc.id } : {});
+      const j = await call('state', topc && topc.v === 'chat' ? { chat: topc.id } : topc && topc.v === 'order' ? { find: topc.id } : {});
       const before = signature();
       apply(j);
       const top = S.st[S.st.length - 1];
@@ -246,7 +362,7 @@
       const ae = document.activeElement;
       if (signature() !== before && !(ae && /INPUT|TEXTAREA|SELECT/.test(ae.tagName)) && !document.getElementById('pvw')) draw();
     } catch (e) { /* пропускаем, повторим позже */ }
-  }, 6000);
+  }, 5000);
 
   // Запуск
   (async function boot() {

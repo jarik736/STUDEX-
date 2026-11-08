@@ -27,6 +27,17 @@ const CATS = ["Рефераты и доклады", "Конспекты", "Че�
 const TYPES = ["Объяснить тему", "Проверить и дать замечания", "Консультация", "Образец для ознакомления", "Помощь с оформлением"];
 const TERMS = ["Сегодня", "3 дня", "Неделя", "Месяц"];
 const CONTACT = /(\+?\d[\d\s\-()]{8,})|@\w{3,}|t\.me|https?:\/\//i;
+const FILE_EXT = /\.(pdf|docx?|pptx?|xlsx?|txt|png|jpe?g|webp|dwg|dxf|zip)$/i;
+const FILE_MAX = 10 * 1024 * 1024; // 10 МБ
+const FILE_TTL_DAYS = 7; // файлы удаляются через 7 дней после закрытия заказа
+// Общий объём всех файлов. Бесплатный лимит Supabase 1 ГБ, оставляем запас на недозагруженные файлы.
+const STORAGE_LIMIT = Number(Deno.env.get("STORAGE_LIMIT_MB") ?? 900) * 1024 * 1024;
+const MIME: Record<string, string> = {
+  pdf: "application/pdf", txt: "text/plain", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp",
+  doc: "application/msword", docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ppt: "application/vnd.ms-powerpoint", pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  xls: "application/vnd.ms-excel", xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+};
 const STN = [
   "Согласование суммы", "Сумма предложена", "Ожидает оплаты", "Оплата сообщена", "В работе",
   "На проверке у администратора", "Одобрено · ждёт покупателя", "Выполнен", "Отменён",
@@ -183,6 +194,43 @@ function text(v: unknown, min: number, max: number, field: string) {
   return s;
 }
 
+// Автоматическая очистка хранилища. Вызывается при каждой загрузке нового файла (need = его размер).
+// 1) Удаляются файлы заказов, закрытых более FILE_TTL_DAYS дней назад.
+// 2) Если новому файлу не хватает места (общий лимит STORAGE_LIMIT), удаляются самые старые файлы:
+//    сначала из закрытых заказов, и только если их мало, из открытых.
+async function dropFiles(rows: Any[]) {
+  for (const c of chunks(rows, 100)) {
+    await db.storage.from("files").remove(c.map((m) => m.file_path));
+    await db.from("messages").update({ file_deleted: true, file_path: null }).in("id", c.map((m) => m.id));
+  }
+}
+async function cleanup(need = 0) {
+  const cutoff = new Date(Date.now() - FILE_TTL_DAYS * 86400_000).toISOString();
+  const { data: old } = await db.from("orders").select("id").in("status", [7, 8]).lt("updated_at", cutoff).limit(200);
+  if (old && old.length) {
+    const ms = await all((a, b) => db.from("messages").select("id,file_path")
+      .in("order_id", old.map((o: Any) => o.id)).eq("file_deleted", false).not("file_path", "is", null).order("id").range(a, b));
+    await dropFiles(ms);
+  }
+  const live = await all((a, b) => db.from("messages").select("id,order_id,file_path,file_size")
+    .eq("file_deleted", false).not("file_path", "is", null).order("id").range(a, b));
+  let total = live.reduce((t: number, m: Any) => t + Number(m.file_size ?? 0), 0);
+  if (total + need <= STORAGE_LIMIT) return;
+  const closed = new Set<number>();
+  for (const c of chunks([...new Set(live.map((m: Any) => m.order_id))] as number[], 100)) {
+    const { data } = await db.from("orders").select("id").in("id", c).gte("status", 7);
+    for (const o of data ?? []) closed.add(o.id);
+  }
+  const queue = [...live.filter((m: Any) => closed.has(m.order_id)), ...live.filter((m: Any) => !closed.has(m.order_id))];
+  const victims: Any[] = [];
+  for (const m of queue) {
+    if (total + need <= STORAGE_LIMIT) break;
+    victims.push(m);
+    total -= Number(m.file_size ?? 0);
+  }
+  await dropFiles(victims);
+}
+
 // ---------- Действия ----------
 const handlers: Record<string, (u: U, b: Any) => Promise<Any>> = {
   async offer_new(u, b) {
@@ -272,6 +320,78 @@ const handlers: Record<string, (u: U, b: Any) => Promise<Any>> = {
     const body = text(b.text, 1, 2000, "message");
     await db.from("messages").insert({ order_id: o.id, sender_id: u.id, kind: "user", body });
     await notify([o.buyer_id === u.id ? o.seller_id : o.buyer_id], `Новое сообщение в заказе №${o.id}`);
+    return { chat: o.id };
+  },
+  async file_prepare(u, b) {
+    const o = await getOrder(b.order);
+    if (o.buyer_id !== u.id && o.seller_id !== u.id) throw new Err("forbidden", 403);
+    if (o.status >= 7) throw new Err("forbidden", 403);
+    const name = String(b.name ?? "").replace(/[\\/\u0000-\u001f]/g, "").trim().slice(0, 100);
+    const size = Number(b.size);
+    if (!FILE_EXT.test(name) || !(size > 0) || size > FILE_MAX) throw new Err("bad_file");
+    if (CONTACT.test(name)) throw new Err("contacts");
+    const since = new Date(Date.now() - 3600_000).toISOString();
+    const { count } = await db.from("messages").select("*", { count: "exact", head: true })
+      .eq("sender_id", u.id).not("file_name", "is", null).gte("created_at", since);
+    if ((count ?? 0) >= 20) throw new Err("rate_limited", 429);
+    try { await cleanup(size); } catch (e) { console.error("cleanup", e); }
+    const ext = name.split(".").pop()!.toLowerCase();
+    const path = `${o.id}/${crypto.randomUUID()}.${ext}`;
+    const { data, error } = await db.storage.from("files").createSignedUploadUrl(path);
+    if (error || !data) throw error ?? new Error("upload_url");
+    return { up: { path, url: data.signedUrl, name }, light: true };
+  },
+  async file_done(u, b) {
+    const o = await getOrder(b.order);
+    if (o.buyer_id !== u.id && o.seller_id !== u.id) throw new Err("forbidden", 403);
+    if (o.status >= 7) throw new Err("forbidden", 403);
+    const path = String(b.path ?? "");
+    const m = new RegExp(`^${o.id}/([0-9a-f-]{36}\\.[a-z0-9]{2,5})$`).exec(path);
+    if (!m) throw new Err("bad_file");
+    const name = String(b.name ?? "").replace(/[\\/\u0000-\u001f]/g, "").trim().slice(0, 100);
+    if (!FILE_EXT.test(name) || CONTACT.test(name)) throw new Err("bad_file");
+    const { data: ls } = await db.storage.from("files").list(String(o.id), { limit: 5, search: m[1] });
+    const f = (ls ?? []).find((x: Any) => x.name === m[1]);
+    if (!f) throw new Err("bad_file");
+    const size = Number(f.metadata?.size ?? 0);
+    if (!(size > 0) || size > FILE_MAX) {
+      await db.storage.from("files").remove([path]);
+      throw new Err("bad_file");
+    }
+    const { data: dup } = await db.from("messages").select("id").eq("file_path", path).maybeSingle();
+    if (dup) throw new Err("conflict", 409);
+    const ext = name.split(".").pop()!.toLowerCase();
+    await db.from("messages").insert({
+      order_id: o.id, sender_id: u.id, kind: "user", body: name,
+      file_path: path, file_name: name, file_size: size, file_type: MIME[ext] ?? "application/octet-stream",
+    });
+    await notify([o.buyer_id === u.id ? o.seller_id : o.buyer_id], `Новый файл в заказе №${o.id}`);
+    return { chat: o.id };
+  },
+  async file_url(u, b) {
+    const { data: m } = await db.from("messages").select("order_id,file_path,file_name,file_type,file_deleted").eq("id", Number(b.msg)).maybeSingle();
+    if (!m || !m.file_name) throw new Err("not_found", 404);
+    const o = await getOrder(m.order_id);
+    const member = o.buyer_id === u.id || o.seller_id === u.id;
+    if (!member && !isAdmin(u)) throw new Err("forbidden", 403);
+    if (m.file_deleted || !m.file_path) throw new Err("gone", 410);
+    // Две ссылки на 10 минут: для просмотра и для скачивания под настоящим именем файла
+    const [view, dl] = await Promise.all([
+      db.storage.from("files").createSignedUrl(m.file_path, 600),
+      db.storage.from("files").createSignedUrl(m.file_path, 600, { download: m.file_name }),
+    ]);
+    if (view.error || !view.data) throw view.error ?? new Error("signed_url");
+    const data = view.data;
+    if (!member) await audit(u, "Просмотр файла", `заказ №${o.id}`);
+    return { file: { url: data.signedUrl, dl: dl.data?.signedUrl ?? data.signedUrl, name: m.file_name, type: m.file_type }, light: true };
+  },
+  async users_find(u, b) {
+    if (!isAdmin(u)) throw new Err("forbidden", 403);
+    const q = String(b.q ?? "").replace(/\D/g, "").slice(0, 12);
+    if (!q) return { found: [], light: true };
+    const { data, error } = await db.rpc("find_users", { q });
+    if (error) throw error;
+    return { found: (data ?? []).map((x: Any) => ({ n: Number(x.number), r: x.role, bl: x.blocked })), light: true };
   },
   async chat_open(u, b) {
     if (!isAdmin(u)) throw new Err("forbidden", 403);
@@ -327,86 +447,159 @@ const handlers: Record<string, (u: U, b: Any) => Promise<Any>> = {
 };
 
 // ---------- Снимок данных для пользователя ----------
-async function snapshot(u: U, chatOrder?: number) {
-  const adm = isAdmin(u);
-  const hhmm = (s: string) => s;
-  const { data: us } = await db.from("users").select("id,number,role,blocked");
-  const users: Any[] = us ?? [];
-  const num = new Map<string, number>(users.map((x) => [x.id, x.number]));
-  const blocked = new Set(users.filter((x) => x.blocked).map((x) => x.id));
+// База отдаёт максимум 1000 строк за запрос и молча обрезает остальное, поэтому большие выборки читаются
+// страницами (all), суммы считаются в базе (rpc), а администратор видит окно последних заказов.
+const CLOSED_WINDOW = 300; // сколько закрытых заказов видит администратор в списках; остальные находятся поиском по номеру
 
-  let oq = db.from("orders").select("*").order("id", { ascending: false });
-  if (!adm) oq = u.role === "seller" ? oq.eq("seller_id", u.id) : oq.eq("buyer_id", u.id);
-  const { data: orders } = await oq;
-  const myOrders: Any[] = orders ?? [];
-
-  const { data: dn } = await db.from("orders").select("seller_id,rating").eq("status", 7);
-  const stat = new Map<string, { k: number; rs: number; rc: number }>();
-  for (const x of dn ?? []) {
-    const s = stat.get(x.seller_id) ?? { k: 0, rs: 0, rc: 0 };
-    s.k++;
-    if (x.rating) { s.rs += x.rating; s.rc++; }
-    stat.set(x.seller_id, s);
+async function all(q: (a: number, b: number) => PromiseLike<Any>): Promise<Any[]> {
+  const out: Any[] = [];
+  for (let from = 0; from < 100_000; from += 1000) {
+    const { data, error } = await q(from, from + 999);
+    if (error) throw error;
+    out.push(...(data ?? []));
+    if (!data || data.length < 1000) break;
   }
+  return out;
+}
+function chunks<T>(a: T[], n: number): T[][] {
+  const r: T[][] = [];
+  for (let i = 0; i < a.length; i += n) r.push(a.slice(i, i + n));
+  return r;
+}
+async function usersByIds(ids: string[]): Promise<Map<string, Any>> {
+  const m = new Map<string, Any>();
+  const parts = await Promise.all(chunks([...new Set(ids)], 100).map(async (c) => {
+    const { data, error } = await db.from("users").select("id,number,role,blocked").in("id", c);
+    if (error) throw error;
+    return data ?? [];
+  }));
+  for (const p of parts) for (const x of p) m.set(x.id, x);
+  return m;
+}
+
+async function snapshot(u: U, chatOrder?: number, findOrder?: number) {
+  const adm = isAdmin(u);
+
+  // Заказы: администратор видит все незакрытые и окно последних закрытых, остальные видят свои.
+  let myOrders: Any[];
+  if (adm) {
+    const active = await all((a, b) => db.from("orders").select("*").lte("status", 6).order("id", { ascending: false }).range(a, b));
+    const { data: closed, error } = await db.from("orders").select("*").in("status", [7, 8]).order("id", { ascending: false }).limit(CLOSED_WINDOW);
+    if (error) throw error;
+    myOrders = [...active, ...(closed ?? [])];
+  } else {
+    const col = u.role === "seller" ? "seller_id" : "buyer_id";
+    myOrders = await all((a, b) => db.from("orders").select("*").eq(col, u.id).order("id", { ascending: false }).range(a, b));
+  }
+  // Заказ, который открыли по номеру или чат которого открыт, добавляется, даже если он вне окна.
+  for (const id of [chatOrder, findOrder]) {
+    if (id && !myOrders.some((o) => o.id === id)) {
+      const { data: o } = await db.from("orders").select("*").eq("id", id).maybeSingle();
+      if (o && (adm || o.buyer_id === u.id || o.seller_id === u.id)) myOrders.push(o);
+    }
+  }
+  myOrders.sort((x, y) => y.id - x.id);
+
+  // Предложения и объявления
+  let fq = db.from("offers").select("*");
+  if (!adm) fq = fq.eq("hidden", false);
+  const { data: offs, error: e1 } = await fq.order("id", { ascending: false }).limit(500);
+  if (e1) throw e1;
+  let aq = db.from("ads").select("*").eq("status", "open");
+  if (!adm) aq = aq.eq("hidden", false);
+  const { data: ads, error: e2 } = await aq.order("id", { ascending: false }).limit(300);
+  if (e2) throw e2;
+  const resp: Any[] = (await Promise.all(chunks((ads ?? []).map((a: Any) => a.id), 100).map(async (c) => {
+    const { data, error } = await db.from("ad_responses").select("ad_id,seller_id").in("ad_id", c);
+    if (error) throw error;
+    return data ?? [];
+  }))).flat();
+
+  // Номера и блокировки только тех людей, которые показываются на экране
+  const um = await usersByIds([
+    ...myOrders.flatMap((o) => [o.buyer_id, o.seller_id]),
+    ...(offs ?? []).map((o: Any) => o.seller_id),
+    ...(ads ?? []).map((a: Any) => a.buyer_id),
+    ...resp.map((r) => r.seller_id),
+  ]);
+  const num = (id: string): number | undefined => um.get(id)?.number;
+  const isBlocked = (id: string) => !!um.get(id)?.blocked;
+
+  // Статистика продавцов и учёт комиссии считаются в базе
+  const { data: st, error: e3 } = await db.rpc("seller_stats");
+  if (e3) throw e3;
+  const stat = new Map<string, { k: number; rs: number; rc: number }>();
+  for (const x of st ?? []) stat.set(x.seller_id, { k: Number(x.sales), rs: Number(x.rsum), rc: Number(x.rcnt) });
   const avg = (id: string) => {
     const s = stat.get(id);
     return s && s.rc ? Math.round((s.rs / s.rc) * 10) / 10 : null;
   };
+  const { data: fn, error: e4 } = await db.rpc("seller_fin");
+  if (e4) throw e4;
+  const acc: Record<number, number> = {};
+  const cs: Record<number, number> = {};
+  for (const x of fn ?? []) {
+    if (adm || x.seller_id === u.id) {
+      acc[x.number] = Number(x.accrued);
+      cs[x.number] = Number(x.paid);
+    }
+  }
+  const sc: Record<number, number> = {};
+  for (const x of st ?? []) if (adm || x.seller_id === u.id) sc[x.number] = Number(x.sales);
 
-  let fq = db.from("offers").select("*").order("id", { ascending: false });
-  if (!adm) fq = fq.eq("hidden", false);
-  const { data: offs } = await fq;
-  const offers = (offs ?? []).filter((o: Any) => adm || !blocked.has(o.seller_id)).map((o: Any) => ({
+  const offers = (offs ?? []).filter((o: Any) => adm || !isBlocked(o.seller_id)).map((o: Any) => ({
     id: o.id, t: o.title, c: o.category, d: o.description, tm: o.term, f: o.format,
-    s: num.get(o.seller_id), r: avg(o.seller_id) ?? "—", n: stat.get(o.seller_id)?.k ?? 0,
+    s: num(o.seller_id), r: avg(o.seller_id) ?? "—", n: stat.get(o.seller_id)?.k ?? 0,
+  }));
+  const adsOut = (ads ?? []).filter((a: Any) => adm || a.buyer_id === u.id || !isBlocked(a.buyer_id)).map((a: Any) => ({
+    id: a.id, t: a.title, c: a.category, d: a.description, tm: a.term, ty: a.type, b: num(a.buyer_id),
+    rs: resp.filter((r) => r.ad_id === a.id).map((r) => num(r.seller_id)),
   }));
 
-  let aq = db.from("ads").select("*").eq("status", "open").order("id", { ascending: false });
-  if (!adm) aq = aq.eq("hidden", false);
-  const { data: ads } = await aq;
-  const { data: resp } = await db.from("ad_responses").select("ad_id,seller_id");
-  const adsOut = (ads ?? []).filter((a: Any) => adm || a.buyer_id === u.id || !blocked.has(a.buyer_id)).map((a: Any) => ({
-    id: a.id, t: a.title, c: a.category, d: a.description, tm: a.term, ty: a.type, b: num.get(a.buyer_id),
-    rs: (resp ?? []).filter((r: Any) => r.ad_id === a.id).map((r: Any) => num.get(r.seller_id)),
-  }));
-
+  // Сообщения: только по незакрытым заказам и по тому чату, который открыт
   const msgs: Record<number, Any[]> = {};
-  const ids = adm ? (chatOrder ? [chatOrder] : []) : myOrders.map((o) => o.id);
-  if (ids.length) {
-    const { data: ms } = await db.from("messages").select("*").in("order_id", ids).order("id");
-    const byId = new Map<number, Any>();
-    for (const o of adm ? [await getOrder(chatOrder!)] : myOrders) byId.set(o.id, o);
-    for (const m of ms ?? []) {
+  const mids = adm ? (chatOrder ? [chatOrder] : []) : myOrders.filter((o) => o.status < 7 || o.id === chatOrder).map((o) => o.id);
+  const byId = new Map<number, Any>(myOrders.map((o) => [o.id, o]));
+  for (const c of chunks(mids, 50)) {
+    const ms = await all((a, b) => db.from("messages").select("*").in("order_id", c).order("id").range(a, b));
+    for (const m of ms) {
       const o = byId.get(m.order_id);
+      if (!o) continue;
       (msgs[m.order_id] ??= []).push({
         w: m.kind === "system" ? "x" : m.sender_id === o.buyer_id ? "b" : "s", t: m.body, at: m.created_at,
+        ...(m.file_name ? { f: { id: m.id, n: m.file_name, s: Number(m.file_size ?? 0), t: m.file_type, gone: !!m.file_deleted } } : {}),
       });
     }
   }
 
-  const { data: lg } = await db.from("ledger").select("*").eq("user_id", u.id);
+  // Личный финансовый журнал
+  const lg = await all((a, b) => db.from("ledger").select("*").eq("user_id", u.id).neq("kind", "commission").order("id").range(a, b));
   const titles = new Map<number, string>(myOrders.map((o) => [o.id, o.title]));
-  const led = (lg ?? []).filter((l: Any) => l.kind !== "commission").map((l: Any) => ({
+  const led = lg.map((l: Any) => ({
     o: l.order_id, w: l.kind === "buyer_spent" ? "b" : "s", s: u.number, a: Number(l.amount), t: titles.get(l.order_id) ?? "",
   }));
 
-  const cs: Record<number, number> = {};
-  const { data: cp } = await db.from("cash_payments").select("seller_id,amount");
-  for (const c of cp ?? []) {
-    if (adm || c.seller_id === u.id) cs[num.get(c.seller_id)!] = (cs[num.get(c.seller_id)!] ?? 0) + Number(c.amount);
-  }
-
-  let cmp: Any[] = [], audit: Any[] = [];
+  // Только для администраторов
+  let usersOut: Any[] = [], cmp: Any[] = [], audit: Any[] = [], tot: Any = null;
+  const hid: string[] = [];
   if (adm) {
-    const { data: cm } = await db.from("complaints").select("id,order_id").eq("status", "open");
+    const cols = "id,number,role,blocked";
+    const rest = await all((a, b) => db.from("users").select(cols).neq("role", "buyer").order("number").range(a, b));
+    const { data: bl } = await db.from("users").select(cols).eq("blocked", true).order("number").limit(500);
+    const { data: rec } = await db.from("users").select(cols).eq("role", "buyer").order("number", { ascending: false }).limit(100);
+    const seen = new Map<string, Any>();
+    for (const x of [...rest, ...(bl ?? []), ...(rec ?? [])]) seen.set(x.id, x);
+    usersOut = [...seen.values()].sort((x, y) => x.number - y.number);
+    const { data: cm } = await db.from("complaints").select("id,order_id").eq("status", "open").limit(200);
     cmp = (cm ?? []).map((c: Any) => ({ id: c.id, o: c.order_id, open: true }));
     const { data: al } = await db.from("audit_log").select("action,details,created_at").order("id", { ascending: false }).limit(100);
     audit = (al ?? []).map((a: Any) => ({ t: a.details ? `${a.action}: ${a.details}` : a.action, at: a.created_at }));
-  }
-  const hid: string[] = [];
-  if (adm) {
     for (const o of offs ?? []) if (o.hidden) hid.push("o" + o.id);
     for (const a of ads ?? []) if (a.hidden) hid.push("a" + a.id);
+    const { data: t, error: e5 } = await db.rpc("admin_totals");
+    if (e5) throw e5;
+    const r = (t ?? [])[0];
+    tot = { n: Number(r?.n ?? 0), d: Number(r?.d ?? 0), c: Number(r?.c ?? 0), sales: Number(r?.sales ?? 0) };
   }
   const { data: nt } = await db.from("notifications").select("body,created_at").eq("user_id", u.id).order("id", { ascending: false }).limit(50);
 
@@ -417,17 +610,16 @@ async function snapshot(u: U, chatOrder?: number) {
     sales: mine.filter((o) => o.seller_id === u.id).length,
     avg: rated.length ? Math.round((rated.reduce((a, o) => a + o.rating, 0) / rated.length) * 10) / 10 : null,
   };
-  void hhmm;
   return {
     me: { number: u.number, role: u.role },
-    users: adm ? users.map((x) => ({ n: x.number, r: x.role, bl: x.blocked })) : [],
-    admins: u.role === "director" ? users.filter((x) => x.role === "admin").map((x) => ({ n: x.number, bl: x.blocked })) : [],
+    users: usersOut.map((x) => ({ n: x.number, r: x.role, bl: x.blocked })),
+    admins: u.role === "director" ? usersOut.filter((x) => x.role === "admin").map((x) => ({ n: x.number, bl: x.blocked })) : [],
     offers, ads: adsOut,
     orders: myOrders.map((o) => ({
-      id: o.id, t: o.title, c: o.category, b: num.get(o.buyer_id), s: num.get(o.seller_id), st: o.status,
+      id: o.id, t: o.title, c: o.category, b: num(o.buyer_id), s: num(o.seller_id), st: o.status,
       amt: o.amount === null ? null : Number(o.amount), set: o.amount_set, rv: o.rating ?? 0,
     })),
-    msgs, led, cs, cmp, audit, hid, stats,
+    msgs, led, cs, acc, sc, tot, cmp, audit, hid, stats,
     nt: (nt ?? []).map((x: Any) => ({ t: x.body, at: x.created_at })),
   };
 }
@@ -452,8 +644,13 @@ Deno.serve(async (req) => {
       if (!h) throw new Err("unknown");
       extra = (await h(u, body)) ?? {};
     }
-    const chat = body.action === "state" && isAdmin(u) ? Number(body.chat) || undefined : extra.chat;
-    return json({ ...extra, state: await snapshot(u, chat) });
+    if (extra.light) {
+      const { light: _l, ...rest } = extra;
+      return json(rest);
+    }
+    const chat = body.action === "state" ? Number(body.chat) || undefined : extra.chat;
+    const find = body.action === "state" ? Number(body.find) || undefined : undefined;
+    return json({ ...extra, state: await snapshot(u, chat, find) });
   } catch (e) {
     if (e instanceof Err) return json({ error: e.code }, e.status);
     console.error(e);
