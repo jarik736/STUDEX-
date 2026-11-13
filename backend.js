@@ -201,7 +201,7 @@
     window.__fu = file.url; window.__fd = file.dl || file.url; window.__fm = f.id; window.__ft = Date.now();
     const e = document.createElement('div');
     e.id = 'pvw';
-    e.innerHTML = '<div class="row" style="padding:12px 16px"><button class="rb" aria-label="Закрыть" onclick="document.getElementById(\'pvw\').remove()">' + ic('back') + '</button><b class="sp" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(file.name) + '</b></div><div style="flex:1;overflow:auto;padding:0 16px 20px">' + b + '<button class="btn" style="margin-top:12px" onclick="__fo(\'dl\')">Скачать файл</button><button class="btn" style="margin-top:8px;background:transparent;border:1px solid rgba(255,255,255,.25)" onclick="__fo(\'open\')">Открыть в браузере</button></div>';
+    e.innerHTML = '<div class="row" style="padding:12px 16px"><button class="rb" aria-label="Закрыть" onclick="document.getElementById(\'pvw\').remove()">' + ic('back') + '</button><b class="sp" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(file.name) + '</b></div><div style="flex:1;overflow:auto;padding:0 16px 20px">' + b + '<button class="btn" style="margin-top:12px" onclick="__fo(\'dl\')">Скачать файл</button><button class="btn" style="margin-top:8px;background:transparent;color:var(--tx,#f5f5f7);border:1px solid rgba(255,255,255,.25)" onclick="__fo(\'open\')">Открыть в браузере</button></div>';
     document.getElementById('app').appendChild(e);
   };
   // Ссылка действует недолго, поэтому перед открытием при необходимости запрашивается новая
