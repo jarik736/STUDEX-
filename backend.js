@@ -63,6 +63,7 @@
       saveLists();
     }
     const rt = s.rt || {};
+    S.rt = rt;
     P.forEach((p) => { const x = rt[p.s]; p.r = x ? x[0] : '—'; p.n = x ? x[1] : 0; });
     S.orders = s.orders || [];
     if (keepObj && !S.orders.some((o) => o.id == keepObj.id)) S.orders.push(keepObj);
@@ -356,12 +357,17 @@
       '<div class="card cl" onclick="go(\'about\')">О платформе</div><div class="card cl" onclick="go(\'policy\')">Политика и правила</div>';
   };
   V.myads = () => S.ads.filter((a) => a.b === ME.number).map(cardA).join('') || '<div class="card mu">У вас нет объявлений.</div>';
+  // Рейтинг и число выполненных заказов продавца (для выбора исполнителя среди откликнувшихся)
+  const sellerStat = (s) => {
+    const x = (S.rt || {})[s];
+    return '<div class="mu">★ ' + (x ? x[0] : '—') + ' · выполнено заказов: ' + (x ? x[1] : 0) + '</div>';
+  };
   V.ad = (id) => {
     const a = ad(id), mine = S.role === 'buyer' && a && a.b === ME.number;
     if (!a) return '<div class="card mu">Объявление недоступно.</div>';
     return '<div class="card"><div class="row"><div class="ic">' + ic(ci(a.c)) + '</div><div class="sp"><b>' + esc(a.t) + '</b><div class="mu">' + a.c + '</div></div></div><p class="mu" style="margin-top:10px">' + esc(a.d) + '</p><div class="row" style="margin-top:10px"><span class="tag">' + a.ty + '</span><span class="tag">Срок: ' + a.tm + '</span></div><p class="mu" style="margin-top:10px">Автор: Покупатель №' + a.b + '</p></div>' +
       (S.role === 'seller' ? (a.rs.indexOf(ME.number) >= 0 ? '<div class="card mu">Вы откликнулись. Ждите решения покупателя.</div>' : '<button class="btn" onclick="respond(' + id + ')">Откликнуться</button>') : '') +
-      (mine ? '<h2>Отклики</h2>' + (a.rs.map((s) => '<div class="card row"><div class="ic">' + cap(26) + '</div><div class="sp"><b>Продавец №' + s + '</b></div><button class="chip on" style="margin:0" onclick="pick(' + id + ',' + s + ')">Выбрать</button></div>').join('') || '<div class="card mu">Откликов пока нет.</div>') : '');
+      (mine ? '<h2>Отклики</h2>' + (a.rs.map((s) => '<div class="card row"><div class="ic">' + cap(26) + '</div><div class="sp"><b>Продавец №' + s + '</b>' + sellerStat(s) + '</div><button class="chip on" style="margin:0" onclick="pick(' + id + ',' + s + ')">Выбрать</button></div>').join('') || '<div class="card mu">Откликов пока нет.</div>') : '');
   };
   V.finance = () => {
     const n = ME.number, A = accrued(n), C2 = paid(n), D = A - C2;
