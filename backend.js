@@ -29,13 +29,23 @@
     const r = await fetch(API, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', apikey: C.ANON_KEY, Authorization: 'Bearer ' + C.ANON_KEY, 'x-init-data': INIT },
-      body: JSON.stringify(Object.assign({ action }, data || {})),
+      body: JSON.stringify(Object.assign({ action, lh: S.lh || '' }, data || {})),
     });
     const j = await r.json().catch(() => ({ error: 'server' }));
     if (!r.ok || j.error) throw j;
     return j;
   }
   const hm = (iso) => new Date(iso).toTimeString().slice(0, 5);
+  // Списки предложений и объявлений хранятся на телефоне, чтобы не загружать их заново при каждом запуске
+  const LKEY = 'studex_lists_' + (() => { try { return JSON.parse(new URLSearchParams(INIT).get('user')).id; } catch (e) { return 0; } })();
+  const saveLists = () => { try { localStorage.setItem(LKEY, JSON.stringify({ lh: S.lh, offers: P, ads: S.ads })); } catch (e) { /* память недоступна */ } };
+  const loadLists = () => {
+    try {
+      const c = JSON.parse(localStorage.getItem(LKEY) || 'null');
+      if (c && c.lh && Array.isArray(c.offers) && Array.isArray(c.ads)) { P.length = 0; c.offers.forEach((o) => P.push(o)); S.ads = c.ads; S.lh = c.lh; }
+    } catch (e) { S.lh = ''; }
+  };
+  const toMsg = (m) => [m.w, m.t, hm(m.at), m.f ? { id: m.f.id, n: m.f.n, s: m.f.gone ? 'файл удалён' : fs(m.f.s), t: m.f.t, gone: m.f.gone } : undefined, m.i];
 
   function apply(j) {
     const s = j.state;
@@ -45,16 +55,22 @@
     const keepId = top0 && (top0.v === 'order' || top0.v === 'chat') ? top0.id : null;
     const keepObj = keepId ? (S.orders || []).find((o) => o.id == keepId) : null;
     S.users = (s.users || []).map((u) => ({ n: u.n, r: RN[u.r], bl: u.bl }));
-    P.length = 0;
-    (s.offers || []).forEach((o) => P.push(o));
-    S.ads = s.ads || [];
+    if (s.offers) {
+      P.length = 0;
+      s.offers.forEach((o) => P.push(o));
+      S.ads = s.ads || [];
+      S.lh = s.lh || '';
+      saveLists();
+    }
+    const rt = s.rt || {};
+    P.forEach((p) => { const x = rt[p.s]; p.r = x ? x[0] : '—'; p.n = x ? x[1] : 0; });
     S.orders = s.orders || [];
     if (keepObj && !S.orders.some((o) => o.id == keepObj.id)) S.orders.push(keepObj);
     S.tot = s.tot || null;
     S.acc = s.acc || {};
     S.sc = s.sc || {};
     S.msgs = {};
-    Object.keys(s.msgs || {}).forEach((k) => { S.msgs[k] = s.msgs[k].map((m) => m.f ? [m.w, m.t, hm(m.at), { id: m.f.id, n: m.f.n, s: m.f.gone ? 'файл удалён' : fs(m.f.s), t: m.f.t, gone: m.f.gone }] : [m.w, m.t, hm(m.at)]); });
+    Object.keys(s.msgs || {}).forEach((k) => { S.msgs[k] = s.msgs[k].map(toMsg); });
     S.led = s.led || [];
     S.cs = s.cs || {};
     S.cmp = s.cmp || [];
@@ -161,6 +177,16 @@
     const ms = document.getElementById('ms');
     if (ms) { ms.innerHTML = msgs(id, S.role === 'seller' ? 's' : 'b'); document.getElementById('mn').scrollTop = 1e5; }
   };
+  let sending = 0, quiet = 0, cpoll = 0;
+  // Показывает новые сообщения; к концу переписки прокручивает, только если человек и так внизу
+  const chatUpdate = (id, force) => {
+    const ms = document.getElementById('ms');
+    if (!ms) return;
+    const mn = document.getElementById('mn');
+    const near = !mn || mn.scrollHeight - mn.scrollTop - mn.clientHeight < 140;
+    ms.innerHTML = msgs(id, S.role === 'seller' ? 's' : 'b');
+    if (mn && (force || near)) mn.scrollTop = 1e5;
+  };
   window.attach = async function (id, el) {
     const f = el.files && el.files[0];
     el.value = '';
@@ -177,8 +203,11 @@
       fd.append('', f);
       const r = await fetch(p.url, { method: 'PUT', headers: { apikey: C.ANON_KEY, 'x-upsert': 'false' }, body: fd });
       if (!r.ok) { console.error('upload', r.status, await r.text().catch(() => '')); throw { error: 'bad_file' }; }
-      apply(await call('file_done', { order: id, path: p.path, name: p.name }));
-      chatRefresh(id);
+      const done = await call('file_done', { order: id, path: p.path, name: p.name });
+      const cur = (S.msgs[id] = S.msgs[id] || []);
+      (done.m || []).forEach((m) => { if (!cur.some((x) => x[4] === m.i)) cur.push(toMsg(m)); });
+      quiet = 0;
+      chatUpdate(id, true);
       toast('Файл отправлен');
     } catch (e) { toast(errMsg(e)); }
     busy = false;
@@ -220,11 +249,24 @@
     if (!t) return;
     if (bad(t)) return toast('Обмен контактами запрещён правилами платформы');
     i.value = '';
+    // Сообщение появляется в чате сразу, не дожидаясь ответа сервера
+    const list = (S.msgs[id] = S.msgs[id] || []);
+    const mine = [S.role === 'seller' ? 's' : 'b', t, hm(new Date().toISOString()), undefined, 0];
+    list.push(mine);
+    sending++;
+    quiet = 0;
+    chatUpdate(id, true);
     try {
-      apply(await call('send', { order: id, text: t }));
-      const ms = document.getElementById('ms');
-      if (ms) { ms.innerHTML = msgs(id, S.role === 'seller' ? 's' : 'b'); document.getElementById('mn').scrollTop = 1e5; }
-    } catch (e) { i.value = t; toast(errMsg(e)); }
+      const r = await call('send', { order: id, text: t });
+      const k = list.indexOf(mine);
+      if (k >= 0) list.splice(k, 1, ...(r.m || []).map(toMsg));
+    } catch (e) {
+      const k = list.indexOf(mine);
+      if (k >= 0) list.splice(k, 1);
+      i.value = t;
+      toast(errMsg(e));
+    } finally { sending--; }
+    chatUpdate(id, true);
   };
 
   // Чат закрытого заказа и старые заказы подгружаются при открытии
@@ -236,9 +278,22 @@
       if (top && top.v === 'chat' && top.id === id) chatRefresh(id);
     } catch (e) { /* повторит ближайший опрос */ }
   }
+  async function fullText(kind, id) {
+    const it = kind === 'ad' ? S.ads.find((a) => a.id == id) : P.find((p) => p.id == id);
+    if (!it || !it.dd) return;
+    try {
+      const r = await call('item_get', { kind, id });
+      it.d = r.d; it.dd = 0;
+      const top = S.st[S.st.length - 1], ae = document.activeElement;
+      if (top && top.id == id && !(ae && /INPUT|TEXTAREA|SELECT/.test(ae.tagName))) draw();
+    } catch (e) { /* останется начало текста */ }
+  }
   const go0 = go;
   window.go = function (v, id) {
     go0(v, id);
+    if (v === 'product') fullText('offer', id);
+    if (v === 'ad') fullText('ad', id);
+    if (v === 'chat') { quiet = 0; cpoll = 0; }
     if (v === 'chat' && S.role !== 'admin' && !(S.msgs[id] && S.msgs[id].length)) loadChat(id);
   };
   window.findOrder = async function () {
@@ -340,6 +395,26 @@
     if (j) { S.od = {}; S.st = [{ v: 'myoff' }]; draw(); }
   };
 
+  // Лёгкое обновление чата: запрашиваются только новые сообщения, а весь снимок раз в полминуты
+  async function pollChat(id) {
+    if (sending) return;
+    const last = (S.msgs[id] || []).reduce((a, m) => Math.max(a, m[4] || 0), 0);
+    try {
+      const r = await call('chat_poll', { order: id, after: last });
+      if (sending) return;
+      const cur = (S.msgs[id] = S.msgs[id] || []);
+      let fresh = false;
+      (r.m || []).forEach((m) => { if (!cur.some((x) => x[4] === m.i)) { cur.push(toMsg(m)); fresh = true; } });
+      const o = or(id);
+      cpoll++;
+      if ((o && (o.st !== r.st || o.amt !== r.amt || o.set !== r.set)) || cpoll % 6 === 0) {
+        apply(await call('state', { chat: id }));
+        fresh = true;
+      }
+      if (fresh) { quiet = 0; const top = S.st[S.st.length - 1]; if (top && top.v === 'chat' && top.id === id) chatUpdate(id, false); }
+    } catch (e) { /* повторим позже */ }
+  }
+
   // Обновление данных раз в несколько секунд
   const signature = () => JSON.stringify([S.orders.map((o) => [o.id, o.st, o.amt]), S.ads.length, S.nt.length, S.cmp.length, Object.keys(S.msgs).map((k) => S.msgs[k].length)]);
   let tick = 0;
@@ -347,6 +422,12 @@
     if (!ME || busy || document.hidden || S.reg || S.splash) return;
     const tc = S.st[S.st.length - 1];
     tick++;
+    if (tc && tc.v === 'chat' && S.role !== 'admin') {
+      // Первую минуту тишины опрос идёт каждые 5 секунд, потом реже: 10, затем 15 секунд
+      quiet++;
+      if (quiet < 12 || quiet % (quiet < 36 ? 2 : 3) === 0) await pollChat(tc.id);
+      return;
+    }
     if (!(tc && tc.v === 'chat') && tick % 12) return; // вне чата обновляем раз в минуту, в чате раз в 5 секунд
     try {
       const topc = S.st[S.st.length - 1];
@@ -373,6 +454,7 @@
       return draw();
     }
     try {
+      loadLists();
       const j = await call('state', {});
       apply(j);
       S.loading = false;
