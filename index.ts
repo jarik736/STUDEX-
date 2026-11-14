@@ -318,9 +318,28 @@ const handlers: Record<string, (u: U, b: Any) => Promise<Any>> = {
     const o = await getOrder(b.order);
     if (o.buyer_id !== u.id && o.seller_id !== u.id) throw new Err("forbidden", 403);
     const body = text(b.text, 1, 2000, "message");
-    await db.from("messages").insert({ order_id: o.id, sender_id: u.id, kind: "user", body });
+    const { data: ins, error } = await db.from("messages").insert({ order_id: o.id, sender_id: u.id, kind: "user", body }).select().single();
+    if (error) throw error;
     await notify([o.buyer_id === u.id ? o.seller_id : o.buyer_id], `Новое сообщение в заказе №${o.id}`);
-    return { chat: o.id };
+    return { m: [msgOut(ins, o)], light: true };
+  },
+  // Полное описание предложения или объявления (в списках приходит только начало)
+  async item_get(u, b) {
+    const table = b.kind === "ad" ? "ads" : "offers";
+    const { data, error } = await db.from(table).select("*").eq("id", Number(b.id)).maybeSingle();
+    if (error) throw error;
+    if (!data) throw new Err("not_found", 404);
+    const owner = table === "ads" ? data.buyer_id : data.seller_id;
+    if (data.hidden && !isAdmin(u) && owner !== u.id) throw new Err("not_found", 404);
+    return { d: data.description, light: true };
+  },
+  // Лёгкое обновление открытого чата: только новые сообщения и признаки изменения заказа
+  async chat_poll(u, b) {
+    const o = await getOrder(b.order);
+    if (o.buyer_id !== u.id && o.seller_id !== u.id) throw new Err("forbidden", 403);
+    const { data, error } = await db.from("messages").select("*").eq("order_id", o.id).gt("id", Number(b.after) || 0).order("id").limit(200);
+    if (error) throw error;
+    return { m: (data ?? []).map((m: Any) => msgOut(m, o)), st: o.status, amt: o.amount === null ? null : Number(o.amount), set: o.amount_set, light: true };
   },
   async file_prepare(u, b) {
     const o = await getOrder(b.order);
@@ -361,12 +380,13 @@ const handlers: Record<string, (u: U, b: Any) => Promise<Any>> = {
     const { data: dup } = await db.from("messages").select("id").eq("file_path", path).maybeSingle();
     if (dup) throw new Err("conflict", 409);
     const ext = name.split(".").pop()!.toLowerCase();
-    await db.from("messages").insert({
+    const { data: ins, error: e2 } = await db.from("messages").insert({
       order_id: o.id, sender_id: u.id, kind: "user", body: name,
       file_path: path, file_name: name, file_size: size, file_type: MIME[ext] ?? "application/octet-stream",
-    });
+    }).select().single();
+    if (e2) throw e2;
     await notify([o.buyer_id === u.id ? o.seller_id : o.buyer_id], `Новый файл в заказе №${o.id}`);
-    return { chat: o.id };
+    return { m: [msgOut(ins, o)], light: true };
   },
   async file_url(u, b) {
     const { data: m } = await db.from("messages").select("order_id,file_path,file_name,file_type,file_deleted").eq("id", Number(b.msg)).maybeSingle();
@@ -449,6 +469,7 @@ const handlers: Record<string, (u: U, b: Any) => Promise<Any>> = {
 // ---------- Снимок данных для пользователя ----------
 // База отдаёт максимум 1000 строк за запрос и молча обрезает остальное, поэтому большие выборки читаются
 // страницами (all), суммы считаются в базе (rpc), а администратор видит окно последних заказов.
+const CLOSED_OWN = 100; // сколько закрытых заказов приходит покупателю и продавцу в списках
 const CLOSED_WINDOW = 300; // сколько закрытых заказов видит администратор в списках; остальные находятся поиском по номеру
 
 async function all(q: (a: number, b: number) => PromiseLike<Any>): Promise<Any[]> {
@@ -477,65 +498,107 @@ async function usersByIds(ids: string[]): Promise<Map<string, Any>> {
   return m;
 }
 
-async function snapshot(u: U, chatOrder?: number, findOrder?: number) {
-  const adm = isAdmin(u);
+async function shortHash(text: string): Promise<string> {
+  const d = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(text));
+  return [...new Uint8Array(d)].slice(0, 8).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+const cut = (t: string) => (t.length > 120 ? t.slice(0, 120) + "…" : t);
 
-  // Заказы: администратор видит все незакрытые и окно последних закрытых, остальные видят свои.
-  let myOrders: Any[];
-  if (adm) {
-    const active = await all((a, b) => db.from("orders").select("*").lte("status", 6).order("id", { ascending: false }).range(a, b));
-    const { data: closed, error } = await db.from("orders").select("*").in("status", [7, 8]).order("id", { ascending: false }).limit(CLOSED_WINDOW);
-    if (error) throw error;
-    myOrders = [...active, ...(closed ?? [])];
-  } else {
-    const col = u.role === "seller" ? "seller_id" : "buyer_id";
-    myOrders = await all((a, b) => db.from("orders").select("*").eq(col, u.id).order("id", { ascending: false }).range(a, b));
-  }
+// Сообщение в том виде, в каком его получает приложение (i нужен для дозагрузки только новых сообщений)
+function msgOut(m: Any, o: Any) {
+  return {
+    i: m.id,
+    w: m.kind === "system" ? "x" : m.sender_id === o.buyer_id ? "b" : "s", t: m.body, at: m.created_at,
+    ...(m.file_name ? { f: { id: m.id, n: m.file_name, s: Number(m.file_size ?? 0), t: m.file_type, gone: !!m.file_deleted } } : {}),
+  };
+}
+
+async function snapshot(u: U, chatOrder?: number, findOrder?: number, have = "") {
+  const adm = isAdmin(u);
+  const ok = (r: Any): Any => {
+    if (r.error) throw r.error;
+    return r.data;
+  };
+
+  // Этап 1: всё, что не зависит друг от друга, запрашивается одновременно.
+  const ordersP: Promise<Any[]> = adm
+    ? Promise.all([
+      all((a, b) => db.from("orders").select("*").lte("status", 6).order("id", { ascending: false }).range(a, b)),
+      (async () => ok(await db.from("orders").select("*").in("status", [7, 8]).order("id", { ascending: false }).limit(CLOSED_WINDOW)))(),
+    ]).then(([active, closed]) => [...active, ...(closed ?? [])])
+    : Promise.all([
+      all((a, b) => db.from("orders").select("*").eq(u.role === "seller" ? "seller_id" : "buyer_id", u.id).lte("status", 6).order("id", { ascending: false }).range(a, b)),
+      (async () => ok(await db.from("orders").select("*").eq(u.role === "seller" ? "seller_id" : "buyer_id", u.id).in("status", [7, 8]).order("id", { ascending: false }).limit(CLOSED_OWN)))(),
+    ]).then(([active, closed]) => [...active, ...(closed ?? [])]);
+  const offersP = (async () => {
+    let q = db.from("offers").select("*");
+    if (!adm) q = q.eq("hidden", false);
+    return ok(await q.order("id", { ascending: false }).limit(500)) ?? [];
+  })();
+  const adsP = (async () => {
+    let q = db.from("ads").select("*").eq("status", "open");
+    if (!adm) q = q.eq("hidden", false);
+    return ok(await q.order("id", { ascending: false }).limit(300)) ?? [];
+  })();
+  const adminP = adm ? (async () => {
+    const cols = "id,number,role,blocked";
+    const [rest, bl, rec, cm, al, t] = await Promise.all([
+      all((a, b) => db.from("users").select(cols).neq("role", "buyer").order("number").range(a, b)),
+      db.from("users").select(cols).eq("blocked", true).order("number").limit(500),
+      db.from("users").select(cols).eq("role", "buyer").order("number", { ascending: false }).limit(100),
+      db.from("complaints").select("id,order_id").eq("status", "open").limit(200),
+      db.from("audit_log").select("action,details,created_at").order("id", { ascending: false }).limit(100),
+      db.rpc("admin_totals"),
+    ]);
+    return { rest, bl: bl.data ?? [], rec: rec.data ?? [], cm: cm.data ?? [], al: al.data ?? [], t: ok(t) ?? [] };
+  })() : Promise.resolve(null);
+  const buysP = u.role === "buyer"
+    ? (async () => (await db.from("orders").select("*", { count: "exact", head: true }).eq("buyer_id", u.id).eq("status", 7)).count ?? 0)()
+    : Promise.resolve(0);
+  const [orders0, offs, ads, stR, fnR, nt, lg, adminD, buys]: Any[] = await Promise.all([
+    ordersP, offersP, adsP, db.rpc("seller_stats"), db.rpc("seller_fin"),
+    (async () => (await db.from("notifications").select("body,created_at").eq("user_id", u.id).order("id", { ascending: false }).limit(50)).data ?? [])(),
+    all((a, b) => db.from("ledger").select("*").eq("user_id", u.id).neq("kind", "commission").order("id").range(a, b)),
+    adminP, buysP,
+  ]);
+  const st = ok(stR), fn = ok(fnR);
+  const myOrders: Any[] = [...orders0];
+
   // Заказ, который открыли по номеру или чат которого открыт, добавляется, даже если он вне окна.
-  for (const id of [chatOrder, findOrder]) {
+  await Promise.all([chatOrder, findOrder].map(async (id) => {
     if (id && !myOrders.some((o) => o.id === id)) {
       const { data: o } = await db.from("orders").select("*").eq("id", id).maybeSingle();
-      if (o && (adm || o.buyer_id === u.id || o.seller_id === u.id)) myOrders.push(o);
+      if (o && (adm || o.buyer_id === u.id || o.seller_id === u.id) && !myOrders.some((x) => x.id === o.id)) myOrders.push(o);
     }
-  }
+  }));
   myOrders.sort((x, y) => y.id - x.id);
 
-  // Предложения и объявления
-  let fq = db.from("offers").select("*");
-  if (!adm) fq = fq.eq("hidden", false);
-  const { data: offs, error: e1 } = await fq.order("id", { ascending: false }).limit(500);
-  if (e1) throw e1;
-  let aq = db.from("ads").select("*").eq("status", "open");
-  if (!adm) aq = aq.eq("hidden", false);
-  const { data: ads, error: e2 } = await aq.order("id", { ascending: false }).limit(300);
-  if (e2) throw e2;
-  const resp: Any[] = (await Promise.all(chunks((ads ?? []).map((a: Any) => a.id), 100).map(async (c) => {
-    const { data, error } = await db.from("ad_responses").select("ad_id,seller_id").in("ad_id", c);
-    if (error) throw error;
-    return data ?? [];
-  }))).flat();
-
-  // Номера и блокировки только тех людей, которые показываются на экране
-  const um = await usersByIds([
-    ...myOrders.flatMap((o) => [o.buyer_id, o.seller_id]),
-    ...(offs ?? []).map((o: Any) => o.seller_id),
-    ...(ads ?? []).map((a: Any) => a.buyer_id),
-    ...resp.map((r) => r.seller_id),
+  // Этап 2: отклики, сообщения и номера людей, которые показываются на экране
+  const mids = adm ? (chatOrder ? [chatOrder] : []) : myOrders.filter((o) => o.status < 7 || o.id === chatOrder).map((o) => o.id);
+  const respP: Promise<Any[]> = Promise.all(chunks(ads.map((a: Any) => a.id), 100).map(async (c) =>
+    ok(await db.from("ad_responses").select("ad_id,seller_id").in("ad_id", c)) ?? [])).then((x) => x.flat());
+  const msgsP: Promise<Any[]> = Promise.all(chunks(mids, 50).map((c) =>
+    all((a, b) => db.from("messages").select("*").in("order_id", c).order("id").range(a, b)))).then((x) => x.flat());
+  const [resp, ms, um] = await Promise.all([
+    respP, msgsP,
+    usersByIds([
+      ...myOrders.flatMap((o) => [o.buyer_id, o.seller_id]),
+      ...offs.map((o: Any) => o.seller_id),
+      ...ads.map((a: Any) => a.buyer_id),
+    ]),
   ]);
+  const missing = resp.map((r) => r.seller_id).filter((id) => !um.has(id));
+  if (missing.length) for (const [k, v] of await usersByIds(missing)) um.set(k, v);
   const num = (id: string): number | undefined => um.get(id)?.number;
   const isBlocked = (id: string) => !!um.get(id)?.blocked;
 
-  // Статистика продавцов и учёт комиссии считаются в базе
-  const { data: st, error: e3 } = await db.rpc("seller_stats");
-  if (e3) throw e3;
+  // Статистика продавцов и учёт комиссии посчитаны в базе
   const stat = new Map<string, { k: number; rs: number; rc: number }>();
   for (const x of st ?? []) stat.set(x.seller_id, { k: Number(x.sales), rs: Number(x.rsum), rc: Number(x.rcnt) });
   const avg = (id: string) => {
     const s = stat.get(id);
     return s && s.rc ? Math.round((s.rs / s.rc) * 10) / 10 : null;
   };
-  const { data: fn, error: e4 } = await db.rpc("seller_fin");
-  if (e4) throw e4;
   const acc: Record<number, number> = {};
   const cs: Record<number, number> = {};
   for (const x of fn ?? []) {
@@ -547,33 +610,31 @@ async function snapshot(u: U, chatOrder?: number, findOrder?: number) {
   const sc: Record<number, number> = {};
   for (const x of st ?? []) if (adm || x.seller_id === u.id) sc[x.number] = Number(x.sales);
 
-  const offers = (offs ?? []).filter((o: Any) => adm || !isBlocked(o.seller_id)).map((o: Any) => ({
-    id: o.id, t: o.title, c: o.category, d: o.description, tm: o.term, f: o.format,
-    s: num(o.seller_id), r: avg(o.seller_id) ?? "—", n: stat.get(o.seller_id)?.k ?? 0,
+  const offers = offs.filter((o: Any) => adm || !isBlocked(o.seller_id)).map((o: Any) => ({
+    id: o.id, t: o.title, c: o.category, d: cut(o.description), ...(o.description.length > 120 ? { dd: 1 } : {}),
+    tm: o.term, f: o.format, s: num(o.seller_id),
   }));
-  const adsOut = (ads ?? []).filter((a: Any) => adm || a.buyer_id === u.id || !isBlocked(a.buyer_id)).map((a: Any) => ({
-    id: a.id, t: a.title, c: a.category, d: a.description, tm: a.term, ty: a.type, b: num(a.buyer_id),
+  const adsOut = ads.filter((a: Any) => adm || a.buyer_id === u.id || !isBlocked(a.buyer_id)).map((a: Any) => ({
+    id: a.id, t: a.title, c: a.category, d: cut(a.description), ...(a.description.length > 120 ? { dd: 1 } : {}),
+    tm: a.term, ty: a.type, b: num(a.buyer_id),
     rs: resp.filter((r) => r.ad_id === a.id).map((r) => num(r.seller_id)),
   }));
+  // Рейтинги и число продаж приходят отдельной маленькой таблицей, чтобы списки не менялись при каждом заказе
+  const rt: Record<number, [number | string, number]> = {};
+  for (const x of st ?? []) rt[x.number] = [Number(x.rcnt) ? Math.round((Number(x.rsum) / Number(x.rcnt)) * 10) / 10 : "—", Number(x.sales)];
+  // Если у приложения уже есть такие же списки, они не отправляются повторно
+  const lh = await shortHash(JSON.stringify([offers, adsOut]));
 
   // Сообщения: только по незакрытым заказам и по тому чату, который открыт
   const msgs: Record<number, Any[]> = {};
-  const mids = adm ? (chatOrder ? [chatOrder] : []) : myOrders.filter((o) => o.status < 7 || o.id === chatOrder).map((o) => o.id);
   const byId = new Map<number, Any>(myOrders.map((o) => [o.id, o]));
-  for (const c of chunks(mids, 50)) {
-    const ms = await all((a, b) => db.from("messages").select("*").in("order_id", c).order("id").range(a, b));
-    for (const m of ms) {
-      const o = byId.get(m.order_id);
-      if (!o) continue;
-      (msgs[m.order_id] ??= []).push({
-        w: m.kind === "system" ? "x" : m.sender_id === o.buyer_id ? "b" : "s", t: m.body, at: m.created_at,
-        ...(m.file_name ? { f: { id: m.id, n: m.file_name, s: Number(m.file_size ?? 0), t: m.file_type, gone: !!m.file_deleted } } : {}),
-      });
-    }
+  for (const m of ms) {
+    const o = byId.get(m.order_id);
+    if (!o) continue;
+    (msgs[m.order_id] ??= []).push(msgOut(m, o));
   }
 
   // Личный финансовый журнал
-  const lg = await all((a, b) => db.from("ledger").select("*").eq("user_id", u.id).neq("kind", "commission").order("id").range(a, b));
   const titles = new Map<number, string>(myOrders.map((o) => [o.id, o.title]));
   const led = lg.map((l: Any) => ({
     o: l.order_id, w: l.kind === "buyer_spent" ? "b" : "s", s: u.number, a: Number(l.amount), t: titles.get(l.order_id) ?? "",
@@ -582,45 +643,35 @@ async function snapshot(u: U, chatOrder?: number, findOrder?: number) {
   // Только для администраторов
   let usersOut: Any[] = [], cmp: Any[] = [], audit: Any[] = [], tot: Any = null;
   const hid: string[] = [];
-  if (adm) {
-    const cols = "id,number,role,blocked";
-    const rest = await all((a, b) => db.from("users").select(cols).neq("role", "buyer").order("number").range(a, b));
-    const { data: bl } = await db.from("users").select(cols).eq("blocked", true).order("number").limit(500);
-    const { data: rec } = await db.from("users").select(cols).eq("role", "buyer").order("number", { ascending: false }).limit(100);
+  if (adm && adminD) {
     const seen = new Map<string, Any>();
-    for (const x of [...rest, ...(bl ?? []), ...(rec ?? [])]) seen.set(x.id, x);
+    for (const x of [...adminD.rest, ...adminD.bl, ...adminD.rec]) seen.set(x.id, x);
     usersOut = [...seen.values()].sort((x, y) => x.number - y.number);
-    const { data: cm } = await db.from("complaints").select("id,order_id").eq("status", "open").limit(200);
-    cmp = (cm ?? []).map((c: Any) => ({ id: c.id, o: c.order_id, open: true }));
-    const { data: al } = await db.from("audit_log").select("action,details,created_at").order("id", { ascending: false }).limit(100);
-    audit = (al ?? []).map((a: Any) => ({ t: a.details ? `${a.action}: ${a.details}` : a.action, at: a.created_at }));
-    for (const o of offs ?? []) if (o.hidden) hid.push("o" + o.id);
-    for (const a of ads ?? []) if (a.hidden) hid.push("a" + a.id);
-    const { data: t, error: e5 } = await db.rpc("admin_totals");
-    if (e5) throw e5;
-    const r = (t ?? [])[0];
+    cmp = adminD.cm.map((c: Any) => ({ id: c.id, o: c.order_id, open: true }));
+    audit = adminD.al.map((a: Any) => ({ t: a.details ? `${a.action}: ${a.details}` : a.action, at: a.created_at }));
+    for (const o of offs) if (o.hidden) hid.push("o" + o.id);
+    for (const a of ads) if (a.hidden) hid.push("a" + a.id);
+    const r = adminD.t[0];
     tot = { n: Number(r?.n ?? 0), d: Number(r?.d ?? 0), c: Number(r?.c ?? 0), sales: Number(r?.sales ?? 0) };
   }
-  const { data: nt } = await db.from("notifications").select("body,created_at").eq("user_id", u.id).order("id", { ascending: false }).limit(50);
 
-  const mine = myOrders.filter((o) => o.status === 7);
-  const rated = myOrders.filter((o) => o.seller_id === u.id && o.status === 7 && o.rating);
+  const sx = u.role === "seller" ? stat.get(u.id) : undefined;
   const stats = {
-    buys: mine.filter((o) => o.buyer_id === u.id).length,
-    sales: mine.filter((o) => o.seller_id === u.id).length,
-    avg: rated.length ? Math.round((rated.reduce((a, o) => a + o.rating, 0) / rated.length) * 10) / 10 : null,
+    buys: Number(buys) || 0,
+    sales: sx ? sx.k : 0,
+    avg: sx ? avg(u.id) : null,
   };
   return {
     me: { number: u.number, role: u.role },
     users: usersOut.map((x) => ({ n: x.number, r: x.role, bl: x.blocked })),
     admins: u.role === "director" ? usersOut.filter((x) => x.role === "admin").map((x) => ({ n: x.number, bl: x.blocked })) : [],
-    offers, ads: adsOut,
+    ...(lh !== have ? { offers, ads: adsOut } : {}), lh, rt,
     orders: myOrders.map((o) => ({
       id: o.id, t: o.title, c: o.category, b: num(o.buyer_id), s: num(o.seller_id), st: o.status,
       amt: o.amount === null ? null : Number(o.amount), set: o.amount_set, rv: o.rating ?? 0,
     })),
     msgs, led, cs, acc, sc, tot, cmp, audit, hid, stats,
-    nt: (nt ?? []).map((x: Any) => ({ t: x.body, at: x.created_at })),
+    nt: nt.map((x: Any) => ({ t: x.body, at: x.created_at })),
   };
 }
 
@@ -650,7 +701,7 @@ Deno.serve(async (req) => {
     }
     const chat = body.action === "state" ? Number(body.chat) || undefined : extra.chat;
     const find = body.action === "state" ? Number(body.find) || undefined : undefined;
-    return json({ ...extra, state: await snapshot(u, chat, find) });
+    return json({ ...extra, state: await snapshot(u, chat, find, String(body.lh ?? "")) });
   } catch (e) {
     if (e instanceof Err) return json({ error: e.code }, e.status);
     console.error(e);
