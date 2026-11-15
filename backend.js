@@ -344,6 +344,7 @@
   };
   window.regEnter = function () { S.reg = 0; S.rg = null; S.splash = false; enter(); draw(); };
 
+  const BUILD = 'r3';
   // Реальные экраны вместо демо-данных
   V.profile = () => {
     const st = S.mystats || {};
@@ -354,7 +355,8 @@
       (S.role === 'buyer' ? '<div class="card cl" onclick="go(\'bal\')">Мои расходы: ' + rub(spent()) + '</div><div class="card cl" onclick="go(\'myads\')">Мои объявления</div><div class="card cl" onclick="go(\'fav\')">Избранное: ' + S.fav.size + '</div>' : '') +
       (S.role === 'seller' ? '<div class="card cl" onclick="go(\'myoff\')">Мои предложения</div>' : '') +
       (S.role === 'buyer' ? '<div class="card cl" onclick="S.reg=1;S.rg=null;draw()">У меня есть код</div>' : '') +
-      '<div class="card cl" onclick="go(\'about\')">О платформе</div><div class="card cl" onclick="go(\'policy\')">Политика и правила</div>';
+      '<div class="card cl" onclick="go(\'about\')">О платформе</div><div class="card cl" onclick="go(\'policy\')">Политика и правила</div>' +
+      '<p class="mu" style="text-align:center;font-size:12px;margin-top:18px">Версия приложения: ' + BUILD + '</p>';
   };
   V.myads = () => S.ads.filter((a) => a.b === ME.number).map(cardA).join('') || '<div class="card mu">У вас нет объявлений.</div>';
   // Рейтинг и число выполненных заказов продавца (для выбора исполнителя среди откликнувшихся)
